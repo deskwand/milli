@@ -14,28 +14,46 @@ type IsPrefix = bool;
 /// referencing words that match the given query tree.
 #[derive(Default)]
 pub struct MatchingWords {
-    inner: Vec<(Vec<MatchingWord>, Vec<PrimitiveWordId>)>,
+    all: Vec<MatchingWord>,
+    inner: Vec<(Vec<usize>, Vec<PrimitiveWordId>)>,
 }
 
 impl MatchingWords {
-    pub fn new(mut matching_words: Vec<(Vec<MatchingWord>, Vec<PrimitiveWordId>)>) -> Self {
+    pub fn debug_description(&self) -> String {
+        let mut s = String::new();
+        s.push('[');
+        for (mws, pid) in self.inner.iter() {
+            s.push('[');
+            for mw in mws {
+                s.push_str(&format!("{mw:?}, "));
+            }
+            s.push_str("]\n");
+        }
+        s.push(']');
+        s
+    }
+    pub fn new(
+        all: Vec<MatchingWord>,
+        mut matching_words: Vec<(Vec<usize>, Vec<PrimitiveWordId>)>,
+    ) -> Self {
         // Sort word by len in DESC order prioritizing the longuest matches,
         // in order to highlight the longuest part of the matched word.
-        matching_words.sort_unstable_by_key(|(mw, _)| Reverse((mw.len(), mw[0].word.len())));
+        matching_words.sort_unstable_by_key(|(mw, _)| Reverse((mw.len(), all[mw[0]].word.len())));
 
-        Self { inner: matching_words }
+        Self { all, inner: matching_words }
     }
 
     /// Returns an iterator over terms that match or partially match the given token.
     pub fn match_token<'a, 'b>(&'a self, token: &'b Token<'b>) -> MatchesIter<'a, 'b> {
-        MatchesIter { inner: Box::new(self.inner.iter()), token }
+        MatchesIter { all: &self.all, inner: Box::new(self.inner.iter()), token }
     }
 }
 
 /// Iterator over terms that match the given token,
 /// This allow to lazily evaluate matches.
 pub struct MatchesIter<'a, 'b> {
-    inner: Box<dyn Iterator<Item = &'a (Vec<MatchingWord>, Vec<PrimitiveWordId>)> + 'a>,
+    all: &'a [MatchingWord],
+    inner: Box<dyn Iterator<Item = &'a (Vec<usize>, Vec<PrimitiveWordId>)> + 'a>,
     token: &'b Token<'b>,
 }
 
@@ -44,20 +62,23 @@ impl<'a> Iterator for MatchesIter<'a, '_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next() {
-            Some((matching_words, ids)) => match matching_words[0].match_token(self.token) {
-                Some(char_len) => {
-                    if matching_words.len() > 1 {
-                        Some(MatchType::Partial(PartialMatch {
-                            matching_words: &matching_words[1..],
-                            ids,
-                            char_len,
-                        }))
-                    } else {
-                        Some(MatchType::Full { char_len, ids })
+            Some((matching_words, ids)) => {
+                match self.all[matching_words[0]].match_token(self.token) {
+                    Some(char_len) => {
+                        if matching_words.len() > 1 {
+                            Some(MatchType::Partial(PartialMatch {
+                                all: &self.all,
+                                matching_words: &matching_words[1..],
+                                ids,
+                                char_len,
+                            }))
+                        } else {
+                            Some(MatchType::Full { char_len, ids })
+                        }
                     }
+                    None => self.next(),
                 }
-                None => self.next(),
-            },
+            }
             None => None,
         }
     }
@@ -126,7 +147,8 @@ pub enum MatchType<'a> {
 /// Structure helper to match several tokens in a row in order to complete a partial match.
 #[derive(Debug, PartialEq)]
 pub struct PartialMatch<'a> {
-    matching_words: &'a [MatchingWord],
+    all: &'a [MatchingWord],
+    matching_words: &'a [usize],
     ids: &'a [PrimitiveWordId],
     char_len: usize,
 }
@@ -137,9 +159,10 @@ impl<'a> PartialMatch<'a> {
     /// - Partial if the given token matches the partial match but doesn't complete it
     /// - Full if the given token completes the partial match
     pub fn match_token(self, token: &Token) -> Option<MatchType<'a>> {
-        self.matching_words[0].match_token(token).map(|char_len| {
+        self.all[self.matching_words[0]].match_token(token).map(|char_len| {
             if self.matching_words.len() > 1 {
                 MatchType::Partial(PartialMatch {
+                    all: &self.all,
                     matching_words: &self.matching_words[1..],
                     ids: self.ids,
                     char_len,
@@ -332,13 +355,14 @@ mod tests {
 
     #[test]
     fn matching_words() {
-        let matching_words = vec![
-            (vec![MatchingWord::new("split".to_string(), 1, true)], vec![0]),
-            (vec![MatchingWord::new("this".to_string(), 0, false)], vec![1]),
-            (vec![MatchingWord::new("world".to_string(), 1, true)], vec![2]),
+        let all = vec![
+            MatchingWord::new("split".to_string(), 1, true),
+            MatchingWord::new("this".to_string(), 0, false),
+            MatchingWord::new("world".to_string(), 1, true),
         ];
+        let matching_words = vec![(vec![0], vec![0]), (vec![1], vec![1]), (vec![2], vec![2])];
 
-        let matching_words = MatchingWords::new(matching_words);
+        let matching_words = MatchingWords::new(all, matching_words);
 
         assert_eq!(
             matching_words

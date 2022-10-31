@@ -503,13 +503,14 @@ mod tests {
     use crate::search::matches::matching_words::MatchingWord;
 
     fn matching_words() -> MatchingWords {
-        let matching_words = vec![
-            (vec![MatchingWord::new("split".to_string(), 0, false)], vec![0]),
-            (vec![MatchingWord::new("the".to_string(), 0, false)], vec![1]),
-            (vec![MatchingWord::new("world".to_string(), 1, true)], vec![2]),
+        let all = vec![
+            MatchingWord::new("split".to_string(), 0, false),
+            MatchingWord::new("the".to_string(), 0, false),
+            MatchingWord::new("world".to_string(), 1, true),
         ];
+        let matching_words = vec![(vec![0], vec![0]), (vec![1], vec![1]), (vec![2], vec![2])];
 
-        MatchingWords::new(matching_words)
+        MatchingWords::new(all, matching_words)
     }
 
     impl MatcherBuilder<'_, Vec<u8>> {
@@ -590,12 +591,13 @@ mod tests {
 
     #[test]
     fn highlight_unicode() {
-        let matching_words = vec![
-            (vec![MatchingWord::new("wessfali".to_string(), 1, true)], vec![0]),
-            (vec![MatchingWord::new("world".to_string(), 1, true)], vec![1]),
+        let all = vec![
+            MatchingWord::new("wessfali".to_string(), 1, true),
+            MatchingWord::new("world".to_string(), 1, true),
         ];
+        let matching_words = vec![(vec![0], vec![0]), (vec![1], vec![1])];
 
-        let matching_words = MatchingWords::new(matching_words);
+        let matching_words = MatchingWords::new(all, matching_words);
 
         let builder = MatcherBuilder::from_matching_words(matching_words);
 
@@ -826,27 +828,23 @@ mod tests {
 
     #[test]
     fn partial_matches() {
+        let all = vec![
+            MatchingWord::new("the".to_string(), 0, false),
+            MatchingWord::new("t".to_string(), 0, false),
+            MatchingWord::new("he".to_string(), 0, false),
+            MatchingWord::new("door".to_string(), 0, false),
+            MatchingWord::new("do".to_string(), 0, false),
+            MatchingWord::new("or".to_string(), 0, false),
+        ];
         let matching_words = vec![
-            (vec![MatchingWord::new("the".to_string(), 0, false)], vec![0]),
-            (
-                vec![
-                    MatchingWord::new("t".to_string(), 0, false),
-                    MatchingWord::new("he".to_string(), 0, false),
-                ],
-                vec![0],
-            ),
-            (vec![MatchingWord::new("door".to_string(), 0, false)], vec![1]),
-            (
-                vec![
-                    MatchingWord::new("do".to_string(), 0, false),
-                    MatchingWord::new("or".to_string(), 0, false),
-                ],
-                vec![1],
-            ),
-            (vec![MatchingWord::new("do".to_string(), 0, false)], vec![2]),
+            (vec![0], vec![0]),
+            (vec![1, 2], vec![0]),
+            (vec![3], vec![1]),
+            (vec![4, 5], vec![1]),
+            (vec![4], vec![2]),
         ];
 
-        let matching_words = MatchingWords::new(matching_words);
+        let matching_words = MatchingWords::new(all, matching_words);
 
         let mut builder = MatcherBuilder::from_matching_words(matching_words);
         builder.highlight_prefix("_".to_string());

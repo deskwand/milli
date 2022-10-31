@@ -1,14 +1,18 @@
 use std::borrow::Cow;
 use std::cmp::max;
+use std::collections::hash_map::{DefaultHasher, Entry};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::{fmt, mem};
 
 use charabia::classifier::ClassifiedTokenIter;
 use charabia::{SeparatorKind, TokenKind};
 use fst::Set;
+use itertools::Itertools;
 use roaring::RoaringBitmap;
 use slice_group_by::GroupBy;
 
-use crate::search::matches::matching_words::{MatchingWord, PrimitiveWordId};
+use crate::search::matches::matching_words::{self, MatchingWord, PrimitiveWordId};
 use crate::search::TermsMatchingStrategy;
 use crate::{CboRoaringBitmapLenCodec, Index, MatchingWords, Result};
 
@@ -22,6 +26,121 @@ pub enum Operation {
     Phrase(Vec<String>),
     Or(IsOptionalWord, Vec<Operation>),
     Query(Query),
+}
+
+impl Operation {
+    fn graphviz_dedup_description(&self) -> String {
+        fn rec(operation: &Operation, s: &mut String) {
+            let mut hasher = DefaultHasher::new();
+            operation.hash(&mut hasher);
+            let id = hasher.finish();
+            match operation {
+                Operation::And(ops) => {
+                    for op in ops {
+                        s.push_str(&format!(
+                            r#"{{ {id} [label = "AND"] }} -> 
+                        "#
+                        ));
+                        rec(op, s);
+                        s.push('\n');
+                    }
+                }
+                Operation::Phrase(p) => {
+                    let phrase = p.iter().join(" ");
+                    s.push_str(&format!(
+                        r#"{{ {id} [label = {phrase:?}] }}
+                    "#
+                    ));
+                }
+                Operation::Or(isoptionalword, ops) => {
+                    let isoptionalword = if *isoptionalword { " (opt)" } else { "" };
+                    for op in ops {
+                        s.push_str(&format!(r#"{{ {id} [label = "OR{isoptionalword}"] }} ->"#));
+                        rec(op, s);
+                        s.push('\n');
+                    }
+                }
+                Operation::Query(q) => {
+                    let Query { prefix, kind } = q;
+                    let prefix = if *prefix { " prefix" } else { "" };
+                    match kind {
+                        QueryKind::Tolerant { typo, word } => {
+                            let label = format!("{word} (tol {typo}{prefix})");
+                            s.push_str(&format!(r#"{{ {id} [label = "{label}"] }}"#));
+                        }
+                        QueryKind::Exact { original_typo, word } => {
+                            let label = format!("{word} (ex, {original_typo})");
+                            s.push_str(&format!(r#"{{ {id} [label = "{label}"] }}"#));
+                        }
+                    }
+                }
+            }
+            s.push('\n');
+        }
+        let mut s = String::new();
+        s.push_str("digraph G { \n concentrate = true\n");
+        rec(self, &mut s);
+        s.push_str("}\n");
+        s
+    }
+    fn graphviz_description(&self) -> String {
+        fn rec(operation: &Operation, s: &mut String, counter: &mut usize) {
+            match operation {
+                Operation::And(ops) => {
+                    let and_counter = *counter;
+                    *counter += 1;
+                    for op in ops {
+                        s.push_str(&format!(
+                            r#"{{ {and_counter} [label = "AND"] }} -> 
+                        "#
+                        ));
+                        rec(op, s, counter);
+                        s.push('\n');
+                    }
+                }
+                Operation::Phrase(p) => {
+                    let phrase = p.iter().join(" ");
+                    s.push_str(&format!(
+                        r#"{{ {counter} [label = {phrase:?}] }}
+                    "#
+                    ));
+                }
+                Operation::Or(isoptionalword, ops) => {
+                    let isoptionalword = if *isoptionalword { " (opt)" } else { "" };
+                    let or_counter = *counter;
+                    *counter += 1;
+                    for op in ops {
+                        s.push_str(&format!(
+                            r#"{{ {or_counter} [label = "OR{isoptionalword}"] }} ->"#
+                        ));
+                        rec(op, s, counter);
+                        s.push('\n');
+                    }
+                }
+                Operation::Query(q) => {
+                    let Query { prefix, kind } = q;
+                    let prefix = if *prefix { " prefix" } else { "" };
+                    match kind {
+                        QueryKind::Tolerant { typo, word } => {
+                            let label = format!("{word} (tol {typo}{prefix})");
+                            s.push_str(&format!(r#"{{ {counter} [label = "{label}"] }}"#));
+                        }
+                        QueryKind::Exact { original_typo, word } => {
+                            let label = format!("{word} (ex, {original_typo})");
+                            s.push_str(&format!(r#"{{ {counter} [label = "{label}"] }}"#));
+                        }
+                    }
+                }
+            }
+            *counter += 1;
+            s.push('\n');
+        }
+        let mut s = String::new();
+        s.push_str("digraph G {\n");
+        rec(self, &mut s, &mut 0);
+        s.push_str("}\n");
+        s
+    }
 }
 
 impl fmt::Debug for Operation {
@@ -534,6 +653,26 @@ fn create_query_tree(
     Ok(Operation::or(true, operation_children))
 }
 
+#[derive(Default, Debug)]
+struct MatchingWordCache {
+    all: Vec<MatchingWord>,
+    map: HashMap<(String, u8, bool), usize>,
+}
+impl MatchingWordCache {
+    fn insert(&mut self, word: String, typo: u8, prefix: bool) -> usize {
+        self.all.push(MatchingWord::new(word, typo, prefix));
+        self.all.len() - 1
+        // match self.map.entry((word.clone(), typo, prefix)) {
+        //     Entry::Occupied(idx) => *idx.get(),
+        //     Entry::Vacant(vacant) => {
+        //         self.all.push(MatchingWord::new(word, typo, prefix));
+        //         vacant.insert(self.all.len() - 1);
+        //         self.all.len() - 1
+        //     }
+        // }
+    }
+}
+
 /// Main function that matchings words used for crop and highlight.
 fn create_matching_words(
     ctx: &impl Context,
@@ -545,7 +684,8 @@ fn create_matching_words(
         ctx: &impl Context,
         authorize_typos: bool,
         part: PrimitiveQueryPart,
-        matching_words: &mut Vec<(Vec<MatchingWord>, Vec<PrimitiveWordId>)>,
+        matching_words: &mut Vec<(Vec<usize>, Vec<PrimitiveWordId>)>,
+        matching_word_cache: &mut MatchingWordCache,
         id: PrimitiveWordId,
     ) -> Result<()> {
         match part {
@@ -556,15 +696,15 @@ fn create_matching_words(
                     for synonym in synonyms {
                         let synonym = synonym
                             .into_iter()
-                            .map(|syn| MatchingWord::new(syn, 0, false))
+                            .map(|syn| matching_word_cache.insert(syn, 0, false))
                             .collect();
                         matching_words.push((synonym, vec![id]));
                     }
                 }
 
                 if let Some((left, right)) = split_best_frequency(ctx, &word)? {
-                    let left = MatchingWord::new(left.to_string(), 0, false);
-                    let right = MatchingWord::new(right.to_string(), 0, false);
+                    let left = matching_word_cache.insert(left.to_string(), 0, false);
+                    let right = matching_word_cache.insert(right.to_string(), 0, false);
                     matching_words.push((vec![left, right], vec![id]));
                 }
 
@@ -574,8 +714,10 @@ fn create_matching_words(
                     TypoConfig { max_typos: 2, word_len_one_typo, word_len_two_typo, exact_words };
 
                 let matching_word = match typos(word, authorize_typos, config) {
-                    QueryKind::Exact { word, .. } => MatchingWord::new(word, 0, prefix),
-                    QueryKind::Tolerant { typo, word } => MatchingWord::new(word, typo, prefix),
+                    QueryKind::Exact { word, .. } => matching_word_cache.insert(word, 0, prefix),
+                    QueryKind::Tolerant { typo, word } => {
+                        matching_word_cache.insert(word, typo, prefix)
+                    }
                 };
                 matching_words.push((vec![matching_word], vec![id]));
             }
@@ -583,7 +725,8 @@ fn create_matching_words(
             PrimitiveQueryPart::Phrase(words) => {
                 let ids: Vec<_> =
                     (0..words.len()).into_iter().map(|i| id + i as PrimitiveWordId).collect();
-                let words = words.into_iter().map(|w| MatchingWord::new(w, 0, false)).collect();
+                let words =
+                    words.into_iter().map(|w| matching_word_cache.insert(w, 0, false)).collect();
                 matching_words.push((words, ids));
             }
         }
@@ -596,7 +739,8 @@ fn create_matching_words(
         ctx: &impl Context,
         authorize_typos: bool,
         query: &[PrimitiveQueryPart],
-        matching_words: &mut Vec<(Vec<MatchingWord>, Vec<PrimitiveWordId>)>,
+        matching_words: &mut Vec<(Vec<usize>, Vec<PrimitiveWordId>)>,
+        matching_word_cache: &mut MatchingWordCache,
         mut id: PrimitiveWordId,
     ) -> Result<()> {
         const MAX_NGRAM: usize = 3;
@@ -614,6 +758,7 @@ fn create_matching_words(
                                 authorize_typos,
                                 part.clone(),
                                 matching_words,
+                                matching_word_cache,
                                 id,
                             )?;
                         }
@@ -638,7 +783,7 @@ fn create_matching_words(
                                 for synonym in synonyms {
                                     let synonym = synonym
                                         .into_iter()
-                                        .map(|syn| MatchingWord::new(syn, 0, false))
+                                        .map(|syn| matching_word_cache.insert(syn, 0, false))
                                         .collect();
                                     matching_words.push((synonym, ids.clone()));
                                 }
@@ -655,10 +800,10 @@ fn create_matching_words(
                             };
                             let matching_word = match typos(word, authorize_typos, config) {
                                 QueryKind::Exact { word, .. } => {
-                                    MatchingWord::new(word, 0, is_prefix)
+                                    matching_word_cache.insert(word, 0, is_prefix)
                                 }
                                 QueryKind::Tolerant { typo, word } => {
-                                    MatchingWord::new(word, typo, is_prefix)
+                                    matching_word_cache.insert(word, typo, is_prefix)
                                 }
                             };
                             matching_words.push((vec![matching_word], ids));
@@ -666,7 +811,14 @@ fn create_matching_words(
                     }
 
                     if !is_last {
-                        ngrams(ctx, authorize_typos, tail, matching_words, id + 1)?;
+                        ngrams(
+                            ctx,
+                            authorize_typos,
+                            tail,
+                            matching_words,
+                            matching_word_cache,
+                            id + 1,
+                        )?;
                     }
                 }
             }
@@ -676,9 +828,10 @@ fn create_matching_words(
         Ok(())
     }
 
+    let mut matching_word_cache = MatchingWordCache::default();
     let mut matching_words = Vec::new();
-    ngrams(ctx, authorize_typos, query, &mut matching_words, 0)?;
-    Ok(MatchingWords::new(matching_words))
+    ngrams(ctx, authorize_typos, query, &mut matching_words, &mut matching_word_cache, 0)?;
+    Ok(MatchingWords::new(matching_word_cache.all, matching_words))
 }
 
 pub type PrimitiveQuery = Vec<PrimitiveQueryPart>;
@@ -795,7 +948,9 @@ pub fn maximum_proximity(operation: &Operation) -> usize {
 
 #[cfg(test)]
 mod test {
+    use std::alloc::{GlobalAlloc, System};
     use std::collections::HashMap;
+    use std::sync::atomic::{self, AtomicI64};
 
     use charabia::Tokenize;
     use maplit::hashmap;
@@ -803,7 +958,9 @@ mod test {
     use rand::{Rng, SeedableRng};
 
     use super::*;
+    use crate::index::tests::TempIndex;
     use crate::index::{DEFAULT_MIN_WORD_LEN_ONE_TYPO, DEFAULT_MIN_WORD_LEN_TWO_TYPOS};
+    use crate::Search;
 
     #[derive(Debug)]
     struct TestContext {
@@ -1298,5 +1455,99 @@ mod test {
             query_tree,
             Operation::Query(Query { prefix: true, kind: QueryKind::Exact { .. } })
         ));
+    }
+
+    #[global_allocator]
+    static ALLOC: CountingAlloc =
+        CountingAlloc { resident: AtomicI64::new(0), allocated: AtomicI64::new(0) };
+
+    pub struct CountingAlloc {
+        pub resident: AtomicI64,
+        pub allocated: AtomicI64,
+    }
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            self.allocated.fetch_add(layout.size() as i64, atomic::Ordering::SeqCst);
+            self.resident.fetch_add(layout.size() as i64, atomic::Ordering::SeqCst);
+
+            System.alloc(layout)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            self.resident.fetch_sub(layout.size() as i64, atomic::Ordering::SeqCst);
+            System.dealloc(ptr, layout)
+        }
+    }
+
+    #[test]
+    fn ten_words() {
+        let resident_before = ALLOC.resident.load(atomic::Ordering::SeqCst);
+        let allocated_before = ALLOC.allocated.load(atomic::Ordering::SeqCst);
+
+        let index = TempIndex::new();
+
+        let rtxn = index.read_txn().unwrap();
+        let query = "a beautiful summer house by the beach overlooking what seems";
+        let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
+        builder.words_limit(10);
+        let (query_tree, pqp, mw) = builder.build(query.tokenize()).unwrap().unwrap();
+
+        // let mut search = Search::new(&rtxn, &index);
+        // search.query("a beautiful summer house by the beach overlooking what seems");
+        // let _ = search.execute();
+
+        let resident_after = ALLOC.resident.load(atomic::Ordering::SeqCst);
+        let allocated_after = ALLOC.allocated.load(atomic::Ordering::SeqCst);
+
+        insta::assert_snapshot!(format!("{}", resident_after - resident_before), @"91311265");
+        insta::assert_snapshot!(format!("{}", allocated_after - allocated_before), @"125948410");
+
+        let _ = query_tree.graphviz_dedup_description();
+
+        // insta::assert_snapshot!(mw.debug_description(), @r###""###);
+    }
+
+    #[test]
+    fn graphviz() {
+        let index = TempIndex::new();
+
+        let rtxn = index.read_txn().unwrap();
+
+        for q in [
+            "a beautiful",
+            "a beautiful summer",
+            "a beautiful summer house",
+            "a beautiful summer house by",
+            "a beautiful summer house by the",
+            "a beautiful summer house by the beach",
+            "a beautiful summer house by the beach overlooking",
+        ] {
+            let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
+            builder.words_limit(10);
+            let (query_tree, pqp, mw) = builder.build(q.tokenize()).unwrap().unwrap();
+            insta::assert_snapshot!(query_tree.graphviz_description());
+        }
+    }
+
+    #[test]
+    fn graphviz_dedup() {
+        let index = TempIndex::new();
+
+        let rtxn = index.read_txn().unwrap();
+
+        for q in [
+            "a beautiful",
+            "a beautiful summer",
+            "a beautiful summer house",
+            "a beautiful summer house by",
+            "a beautiful summer house by the",
+            "a beautiful summer house by the beach",
+            "a beautiful summer house by the beach overlooking",
+        ] {
+            let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
+            builder.words_limit(10);
+            let (query_tree, pqp, mw) = builder.build(q.tokenize()).unwrap().unwrap();
+            insta::assert_snapshot!(query_tree.graphviz_dedup_description());
+        }
     }
 }
