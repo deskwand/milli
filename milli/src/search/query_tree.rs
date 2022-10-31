@@ -1365,23 +1365,30 @@ mod test {
         }
     }
 
+    // This test must be run
     #[test]
     fn ten_words() {
         let resident_before = ALLOC.resident.load(atomic::Ordering::SeqCst);
         let allocated_before = ALLOC.allocated.load(atomic::Ordering::SeqCst);
 
         let index = TempIndex::new();
-
         let rtxn = index.read_txn().unwrap();
         let query = "a beautiful summer house by the beach overlooking what seems";
         let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
         builder.words_limit(10);
-        let (_query_tree, _pqp, _mw) = builder.build(query.tokenize()).unwrap().unwrap();
-
+        let x = builder.build(query.tokenize()).unwrap().unwrap();
         let resident_after = ALLOC.resident.load(atomic::Ordering::SeqCst);
         let allocated_after = ALLOC.allocated.load(atomic::Ordering::SeqCst);
 
-        insta::assert_snapshot!(format!("{}", resident_after - resident_before), @"91311265");
-        insta::assert_snapshot!(format!("{}", allocated_after - allocated_before), @"125948410");
+        insta::assert_snapshot!(format!("{}", resident_after - resident_before), @"4521710");
+        insta::assert_snapshot!(format!("{}", allocated_after - allocated_before), @"7259092");
+
+        // Note, if the matching word cache is deactivated, the memory usage is:
+        // insta::assert_snapshot!(format!("{}", resident_after - resident_before), @"91311265");
+        // insta::assert_snapshot!(format!("{}", allocated_after - allocated_before), @"125948410");
+        // or about 20x more resident memory (90MB vs 4.5MB)
+
+        // Use x
+        let _x = x;
     }
 }
