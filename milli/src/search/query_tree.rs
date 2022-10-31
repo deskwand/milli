@@ -660,16 +660,19 @@ struct MatchingWordCache {
 }
 impl MatchingWordCache {
     fn insert(&mut self, word: String, typo: u8, prefix: bool) -> usize {
-        self.all.push(MatchingWord::new(word, typo, prefix));
-        self.all.len() - 1
-        // match self.map.entry((word.clone(), typo, prefix)) {
-        //     Entry::Occupied(idx) => *idx.get(),
-        //     Entry::Vacant(vacant) => {
-        //         self.all.push(MatchingWord::new(word, typo, prefix));
-        //         vacant.insert(self.all.len() - 1);
-        //         self.all.len() - 1
-        //     }
-        // }
+        // Toggle the (un)commented code to switch between cached and non-cached
+        // implementations.
+
+        // self.all.push(MatchingWord::new(word, typo, prefix));
+        // self.all.len() - 1
+        match self.map.entry((word.clone(), typo, prefix)) {
+            Entry::Occupied(idx) => *idx.get(),
+            Entry::Vacant(vacant) => {
+                self.all.push(MatchingWord::new(word, typo, prefix));
+                vacant.insert(self.all.len() - 1);
+                self.all.len() - 1
+            }
+        }
     }
 }
 
