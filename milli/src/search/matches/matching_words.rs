@@ -19,19 +19,6 @@ pub struct MatchingWords {
 }
 
 impl MatchingWords {
-    pub fn debug_description(&self) -> String {
-        let mut s = String::new();
-        s.push('[');
-        for (mws, pid) in self.inner.iter() {
-            s.push('[');
-            for mw in mws {
-                s.push_str(&format!("{mw:?}, "));
-            }
-            s.push_str("]\n");
-        }
-        s.push(']');
-        s
-    }
     pub fn new(
         all: Vec<MatchingWord>,
         mut matching_words: Vec<(Vec<usize>, Vec<PrimitiveWordId>)>,
