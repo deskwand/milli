@@ -1,18 +1,17 @@
 use std::borrow::Cow;
 use std::cmp::max;
-use std::collections::hash_map::{DefaultHasher, Entry};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::{fmt, mem};
 
 use charabia::classifier::ClassifiedTokenIter;
 use charabia::{SeparatorKind, TokenKind};
 use fst::Set;
-use itertools::Itertools;
 use roaring::RoaringBitmap;
 use slice_group_by::GroupBy;
 
-use crate::search::matches::matching_words::{self, MatchingWord, PrimitiveWordId};
+use crate::search::matches::matching_words::{MatchingWord, PrimitiveWordId};
 use crate::search::TermsMatchingStrategy;
 use crate::{CboRoaringBitmapLenCodec, Index, MatchingWords, Result};
 
@@ -26,121 +25,6 @@ pub enum Operation {
     Phrase(Vec<String>),
     Or(IsOptionalWord, Vec<Operation>),
     Query(Query),
-}
-
-impl Operation {
-    fn graphviz_dedup_description(&self) -> String {
-        fn rec(operation: &Operation, s: &mut String) {
-            let mut hasher = DefaultHasher::new();
-            operation.hash(&mut hasher);
-            let id = hasher.finish();
-            match operation {
-                Operation::And(ops) => {
-                    for op in ops {
-                        s.push_str(&format!(
-                            r#"{{ {id} [label = "AND"] }} -> 
-                        "#
-                        ));
-                        rec(op, s);
-                        s.push('\n');
-                    }
-                }
-                Operation::Phrase(p) => {
-                    let phrase = p.iter().join(" ");
-                    s.push_str(&format!(
-                        r#"{{ {id} [label = {phrase:?}] }}
-                    "#
-                    ));
-                }
-                Operation::Or(isoptionalword, ops) => {
-                    let isoptionalword = if *isoptionalword { " (opt)" } else { "" };
-                    for op in ops {
-                        s.push_str(&format!(r#"{{ {id} [label = "OR{isoptionalword}"] }} ->"#));
-                        rec(op, s);
-                        s.push('\n');
-                    }
-                }
-                Operation::Query(q) => {
-                    let Query { prefix, kind } = q;
-                    let prefix = if *prefix { " prefix" } else { "" };
-                    match kind {
-                        QueryKind::Tolerant { typo, word } => {
-                            let label = format!("{word} (tol {typo}{prefix})");
-                            s.push_str(&format!(r#"{{ {id} [label = "{label}"] }}"#));
-                        }
-                        QueryKind::Exact { original_typo, word } => {
-                            let label = format!("{word} (ex, {original_typo})");
-                            s.push_str(&format!(r#"{{ {id} [label = "{label}"] }}"#));
-                        }
-                    }
-                }
-            }
-            s.push('\n');
-        }
-        let mut s = String::new();
-        s.push_str("digraph G { \n concentrate = true\n");
-        rec(self, &mut s);
-        s.push_str("}\n");
-        s
-    }
-    fn graphviz_description(&self) -> String {
-        fn rec(operation: &Operation, s: &mut String, counter: &mut usize) {
-            match operation {
-                Operation::And(ops) => {
-                    let and_counter = *counter;
-                    *counter += 1;
-                    for op in ops {
-                        s.push_str(&format!(
-                            r#"{{ {and_counter} [label = "AND"] }} -> 
-                        "#
-                        ));
-                        rec(op, s, counter);
-                        s.push('\n');
-                    }
-                }
-                Operation::Phrase(p) => {
-                    let phrase = p.iter().join(" ");
-                    s.push_str(&format!(
-                        r#"{{ {counter} [label = {phrase:?}] }}
-                    "#
-                    ));
-                }
-                Operation::Or(isoptionalword, ops) => {
-                    let isoptionalword = if *isoptionalword { " (opt)" } else { "" };
-                    let or_counter = *counter;
-                    *counter += 1;
-                    for op in ops {
-                        s.push_str(&format!(
-                            r#"{{ {or_counter} [label = "OR{isoptionalword}"] }} ->"#
-                        ));
-                        rec(op, s, counter);
-                        s.push('\n');
-                    }
-                }
-                Operation::Query(q) => {
-                    let Query { prefix, kind } = q;
-                    let prefix = if *prefix { " prefix" } else { "" };
-                    match kind {
-                        QueryKind::Tolerant { typo, word } => {
-                            let label = format!("{word} (tol {typo}{prefix})");
-                            s.push_str(&format!(r#"{{ {counter} [label = "{label}"] }}"#));
-                        }
-                        QueryKind::Exact { original_typo, word } => {
-                            let label = format!("{word} (ex, {original_typo})");
-                            s.push_str(&format!(r#"{{ {counter} [label = "{label}"] }}"#));
-                        }
-                    }
-                }
-            }
-            *counter += 1;
-            s.push('\n');
-        }
-        let mut s = String::new();
-        s.push_str("digraph G {\n");
-        rec(self, &mut s, &mut 0);
-        s.push_str("}\n");
-        s
-    }
 }
 
 impl fmt::Debug for Operation {
@@ -963,7 +847,6 @@ mod test {
     use super::*;
     use crate::index::tests::TempIndex;
     use crate::index::{DEFAULT_MIN_WORD_LEN_ONE_TYPO, DEFAULT_MIN_WORD_LEN_TWO_TYPOS};
-    use crate::Search;
 
     #[derive(Debug)]
     struct TestContext {
@@ -1493,64 +1376,12 @@ mod test {
         let query = "a beautiful summer house by the beach overlooking what seems";
         let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
         builder.words_limit(10);
-        let (query_tree, pqp, mw) = builder.build(query.tokenize()).unwrap().unwrap();
-
-        // let mut search = Search::new(&rtxn, &index);
-        // search.query("a beautiful summer house by the beach overlooking what seems");
-        // let _ = search.execute();
+        let (_query_tree, _pqp, _mw) = builder.build(query.tokenize()).unwrap().unwrap();
 
         let resident_after = ALLOC.resident.load(atomic::Ordering::SeqCst);
         let allocated_after = ALLOC.allocated.load(atomic::Ordering::SeqCst);
 
         insta::assert_snapshot!(format!("{}", resident_after - resident_before), @"91311265");
         insta::assert_snapshot!(format!("{}", allocated_after - allocated_before), @"125948410");
-
-        let _ = query_tree.graphviz_dedup_description();
-
-        // insta::assert_snapshot!(mw.debug_description(), @r###""###);
-    }
-
-    #[test]
-    fn graphviz() {
-        let index = TempIndex::new();
-
-        let rtxn = index.read_txn().unwrap();
-
-        for q in [
-            "a beautiful",
-            "a beautiful summer",
-            "a beautiful summer house",
-            "a beautiful summer house by",
-            "a beautiful summer house by the",
-            "a beautiful summer house by the beach",
-            "a beautiful summer house by the beach overlooking",
-        ] {
-            let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
-            builder.words_limit(10);
-            let (query_tree, pqp, mw) = builder.build(q.tokenize()).unwrap().unwrap();
-            insta::assert_snapshot!(query_tree.graphviz_description());
-        }
-    }
-
-    #[test]
-    fn graphviz_dedup() {
-        let index = TempIndex::new();
-
-        let rtxn = index.read_txn().unwrap();
-
-        for q in [
-            "a beautiful",
-            "a beautiful summer",
-            "a beautiful summer house",
-            "a beautiful summer house by",
-            "a beautiful summer house by the",
-            "a beautiful summer house by the beach",
-            "a beautiful summer house by the beach overlooking",
-        ] {
-            let mut builder = QueryTreeBuilder::new(&rtxn, &index).unwrap();
-            builder.words_limit(10);
-            let (query_tree, pqp, mw) = builder.build(q.tokenize()).unwrap().unwrap();
-            insta::assert_snapshot!(query_tree.graphviz_dedup_description());
-        }
     }
 }
