@@ -40,10 +40,6 @@ name = "search_geo"
 harness = false
 
 [[bench]]
-name = "search_movies"
-harness = false
-
-[[bench]]
 name = "indexing"
 harness = false
 
