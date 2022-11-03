@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["milli", "filter-parser", "flatten-serde-json", "json-depth-checker", "benchmarks", "cli"]
+members = ["milli", "filter-parser", "flatten-serde-json", "json-depth-checker", "benchmarks", "cli", "example"]
 default-members = ["milli"]
 
 [profile.dev]

@@ -1,6 +1,5 @@
 use std::convert::TryFrom;
 use std::mem::take;
-use std::ops::BitOr;
 
 use itertools::Itertools;
 use log::debug;
@@ -19,6 +18,7 @@ pub struct Exactness<'t> {
     bucket_candidates: RoaringBitmap,
     parent: Box<dyn Criterion + 't>,
     query: Vec<ExactQueryPart>,
+    cache: Option<ExactWordsCombinationCache>,
 }
 
 impl<'t> Exactness<'t> {
@@ -39,6 +39,7 @@ impl<'t> Exactness<'t> {
             bucket_candidates: RoaringBitmap::new(),
             parent,
             query,
+            cache: None,
         })
     }
 }
@@ -50,7 +51,6 @@ impl<'t> Criterion for Exactness<'t> {
         if let Some(state) = self.state.as_mut() {
             state.difference_with(params.excluded_candidates);
         }
-
         loop {
             debug!("Exactness at state {:?}", self.state);
 
@@ -61,7 +61,9 @@ impl<'t> Criterion for Exactness<'t> {
                     self.query_tree = None;
                 }
                 Some(state) => {
-                    let (candidates, state) = resolve_state(self.ctx, take(state), &self.query)?;
+                    // println!("iteration!");
+                    let (candidates, state) =
+                        resolve_state(self.ctx, take(state), &self.query, &mut self.cache)?;
                     self.state = state;
 
                     return Ok(Some(CriterionResult {
@@ -163,12 +165,13 @@ impl Default for State {
         Self::Remainings(vec![])
     }
 }
-
+// static mut COUNT: usize = 0;
 #[logging_timer::time("Exactness::{}")]
 fn resolve_state(
     ctx: &dyn Context,
     state: State,
     query: &[ExactQueryPart],
+    cache: &mut Option<ExactWordsCombinationCache>,
 ) -> Result<(RoaringBitmap, Option<State>)> {
     use State::*;
     match state {
@@ -183,6 +186,7 @@ fn resolve_state(
                         let mut attribute_candidates_array =
                             attribute_start_with_docids(ctx, id, query)?;
                         attribute_candidates_array.push(attribute_allowed_docids);
+
                         candidates |= intersection_of(attribute_candidates_array.iter().collect());
                     }
                 }
@@ -200,6 +204,10 @@ fn resolve_state(
             let attributes_ids = ctx.searchable_fields_ids()?;
             for id in attributes_ids {
                 let attribute_candidates_array = attribute_start_with_docids(ctx, id, query)?;
+                // println!("attribute_candidates_array len: {}", attribute_candidates_array.len());
+                // for (i, rb) in attribute_candidates_array.iter().enumerate() {
+                //     println!("    {i}: {}", rb.len());
+                // }
                 candidates |= intersection_of(attribute_candidates_array.iter().collect());
             }
 
@@ -210,56 +218,22 @@ fn resolve_state(
             Ok((candidates, Some(ExactWords(allowed_candidates))))
         }
         ExactWords(mut allowed_candidates) => {
-            let number_of_part = query.len();
-            let mut parts_candidates_array = Vec::with_capacity(number_of_part);
+            let owned_cache = if let Some(cache) = cache.take() {
+                cache
+            } else {
+                println!("compute combinations");
+                compute_combinations(ctx, query)?
+            };
 
-            for part in query {
-                let mut candidates = RoaringBitmap::new();
-                use ExactQueryPart::*;
-                match part {
-                    Synonyms(synonyms) => {
-                        for synonym in synonyms {
-                            if let Some(synonym_candidates) = ctx.word_docids(synonym)? {
-                                candidates |= synonym_candidates;
-                            }
-                        }
-                    }
-                    // compute intersection on pair of words with a proximity of 0.
-                    Phrase(phrase) => {
-                        candidates |= resolve_phrase(ctx, phrase)?;
-                    }
-                }
-                parts_candidates_array.push(candidates);
+            let mut candidates_array = owned_cache.combinations.clone();
+            for candidates in candidates_array.iter_mut() {
+                *candidates &= &allowed_candidates;
+                allowed_candidates -= &*candidates;
             }
+            let all_exact_candidates = candidates_array.pop().unwrap();
 
-            let mut candidates_array = Vec::new();
-
-            // compute documents that contain all exact words.
-            let mut all_exact_candidates = intersection_of(parts_candidates_array.iter().collect());
-            all_exact_candidates &= &allowed_candidates;
-            allowed_candidates -= &all_exact_candidates;
-
-            // push the result of combinations of exact words grouped by the number of exact words contained by documents.
-            for c_count in (1..number_of_part).rev() {
-                let mut combinations_candidates = parts_candidates_array
-                    .iter()
-                    // create all `c_count` combinations of exact words
-                    .combinations(c_count)
-                    // intersect each word candidates in combinations
-                    .map(intersection_of)
-                    // union combinations of `c_count` exact words
-                    .fold(RoaringBitmap::new(), RoaringBitmap::bitor);
-                // only keep allowed candidates
-                combinations_candidates &= &allowed_candidates;
-                // remove current candidates from allowed candidates
-                allowed_candidates -= &combinations_candidates;
-                candidates_array.push(combinations_candidates);
-            }
-
-            // push remainings allowed candidates as the worst valid candidates
-            candidates_array.push(allowed_candidates);
-            // reverse the array to be able to pop candidates from the best to the worst.
-            candidates_array.reverse();
+            candidates_array.insert(0, allowed_candidates);
+            *cache = Some(owned_cache);
 
             Ok((all_exact_candidates, Some(Remainings(candidates_array))))
         }
@@ -313,14 +287,11 @@ fn attribute_start_with_docids(
 
     Ok(attribute_candidates_array)
 }
-
+// static mut ELAPSED: f64 = 0.0;
+#[inline(never)]
 fn intersection_of(mut rbs: Vec<&RoaringBitmap>) -> RoaringBitmap {
     rbs.sort_unstable_by_key(|rb| rb.len());
-    let mut iter = rbs.into_iter();
-    match iter.next() {
-        Some(first) => iter.fold(first.clone(), |acc, rb| acc & rb),
-        None => RoaringBitmap::new(),
-    }
+    roaring::MultiOps::intersection(rbs.into_iter())
 }
 
 #[derive(Debug, Clone)]
@@ -359,4 +330,69 @@ impl ExactQueryPart {
 
         Ok(part)
     }
+}
+
+struct ExactWordsCombinationCache {
+    // index 0 is only 1 word
+    combinations: Vec<RoaringBitmap>,
+    unioned: RoaringBitmap,
+}
+
+fn compute_combinations(
+    ctx: &dyn Context,
+    query: &[ExactQueryPart],
+) -> Result<ExactWordsCombinationCache> {
+    let number_of_part = query.len();
+    let mut parts_candidates_array = Vec::with_capacity(number_of_part);
+    // println!("query: {query:?}");
+    for part in query {
+        let mut candidates = RoaringBitmap::new();
+        use ExactQueryPart::*;
+        match part {
+            Synonyms(synonyms) => {
+                for synonym in synonyms {
+                    if let Some(synonym_candidates) = ctx.word_docids(synonym)? {
+                        candidates |= synonym_candidates;
+                    }
+                }
+            }
+            // compute intersection on pair of words with a proximity of 0.
+            Phrase(phrase) => {
+                candidates |= resolve_phrase(ctx, phrase)?;
+            }
+        }
+        parts_candidates_array.push(candidates);
+    }
+
+    let mut candidates_array = Vec::new();
+
+    let mut forbidden_candidates = RoaringBitmap::new();
+
+    // push the result of combinations of exact words grouped by the number of exact words contained by documents.
+    for c_count in (1..=number_of_part).rev() {
+        // Huge bottleneck here
+        // The number of combinations for 10 words is:
+        //
+        let mut i = 0;
+        let mut combinations_candidates = RoaringBitmap::new();
+        for pick in parts_candidates_array
+            .iter()
+            // create all `c_count` combinations of exact words
+            .combinations(c_count)
+        {
+            combinations_candidates |= intersection_of(pick);
+            i += 1;
+        }
+        combinations_candidates -= &forbidden_candidates;
+        forbidden_candidates |= &combinations_candidates;
+
+        candidates_array.push(combinations_candidates);
+    }
+
+    // push remainings allowed candidates as the worst valid candidates
+    // candidates_array.push(allowed_candidates);
+
+    candidates_array.reverse();
+
+    Ok(ExactWordsCombinationCache { combinations: candidates_array, unioned: forbidden_candidates })
 }
