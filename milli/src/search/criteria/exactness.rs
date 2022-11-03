@@ -1,9 +1,9 @@
 use std::convert::TryFrom;
 use std::mem::take;
 
-use itertools::Itertools;
+use itertools::{Combinations, Itertools};
 use log::debug;
-use roaring::RoaringBitmap;
+use roaring::{MultiOps, RoaringBitmap};
 
 use crate::search::criteria::{
     resolve_phrase, resolve_query_tree, Context, Criterion, CriterionParameters, CriterionResult,
@@ -221,7 +221,7 @@ fn resolve_state(
             let owned_cache = if let Some(cache) = cache.take() {
                 cache
             } else {
-                println!("compute combinations");
+                // println!("compute combinations");
                 compute_combinations(ctx, query)?
             };
 
@@ -335,7 +335,6 @@ impl ExactQueryPart {
 struct ExactWordsCombinationCache {
     // index 0 is only 1 word
     combinations: Vec<RoaringBitmap>,
-    unioned: RoaringBitmap,
 }
 
 fn compute_combinations(
@@ -363,36 +362,160 @@ fn compute_combinations(
         }
         parts_candidates_array.push(candidates);
     }
+    let mut combinations = ComputeCombinations::new(parts_candidates_array).finish();
 
-    let mut candidates_array = Vec::new();
+    Ok(ExactWordsCombinationCache { combinations })
+}
 
-    let mut forbidden_candidates = RoaringBitmap::new();
-
-    // push the result of combinations of exact words grouped by the number of exact words contained by documents.
-    for c_count in (1..=number_of_part).rev() {
-        // Huge bottleneck here
-        // The number of combinations for 10 words is:
-        //
-        let mut i = 0;
-        let mut combinations_candidates = RoaringBitmap::new();
-        for pick in parts_candidates_array
-            .iter()
-            // create all `c_count` combinations of exact words
-            .combinations(c_count)
-        {
-            combinations_candidates |= intersection_of(pick);
-            i += 1;
+#[derive(Debug)]
+struct ComputeCombinations {
+    nbr_parts: usize,
+    levels: Vec<Vec<(RoaringBitmap, usize)>>,
+}
+impl ComputeCombinations {
+    fn new(parts_candidates_array: Vec<RoaringBitmap>) -> Self {
+        let nbr_parts = parts_candidates_array.len();
+        let base_level: Vec<(RoaringBitmap, usize)> = parts_candidates_array
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(i, candidates)| (candidates, i))
+            .collect();
+        if nbr_parts == 1 {
+            return Self { nbr_parts, levels: vec![base_level] };
         }
-        combinations_candidates -= &forbidden_candidates;
-        forbidden_candidates |= &combinations_candidates;
+        let mut levels = vec![base_level];
+        let mut last_level = 0;
+        for _ in 2..=nbr_parts {
+            let mut new_level = vec![];
+            for (base_combination, last_part_index) in levels[last_level].iter() {
+                for part in last_part_index + 1..nbr_parts {
+                    new_level.push((base_combination & &parts_candidates_array[part], part))
+                }
+            }
+            levels.push(new_level);
+            last_level += 1;
+        }
 
-        candidates_array.push(combinations_candidates);
+        ComputeCombinations { nbr_parts, levels }
+    }
+    fn finish(self) -> Vec<RoaringBitmap> {
+        let mut combinations = vec![];
+        let mut forbidden = RoaringBitmap::new();
+        for level in self.levels.into_iter().rev() {
+            let mut unioned = MultiOps::union(level.into_iter().map(|x| x.0));
+            unioned -= &forbidden;
+            forbidden |= &unioned;
+            combinations.push(unioned)
+        }
+        combinations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use roaring::RoaringBitmap;
+
+    use super::ComputeCombinations;
+    use crate::snapshot_tests::display_bitmap;
+
+    fn print_compute_combinations(x: &ComputeCombinations) -> String {
+        let mut s = String::new();
+        for (i, level) in x.levels.iter().enumerate() {
+            s.push_str(&format!("Level {}:\n", i + 1));
+            for (bitmap, last) in level {
+                s.push_str(&format!("    {last} {}\n", &display_bitmap(&bitmap)));
+            }
+        }
+        s
+    }
+    fn print_combinations(rbs: &[RoaringBitmap]) -> String {
+        let mut s = String::new();
+        for rb in rbs {
+            s.push_str(&format!("{}\n", &display_bitmap(rb)));
+        }
+        s
     }
 
-    // push remainings allowed candidates as the worst valid candidates
-    // candidates_array.push(allowed_candidates);
+    #[test]
+    fn compute_combinations_4() {
+        let b0: RoaringBitmap = (0..).into_iter().map(|x| 2 * x).take_while(|x| *x < 150).collect();
+        let b1: RoaringBitmap = (0..).into_iter().map(|x| 3 * x).take_while(|x| *x < 150).collect();
+        let b2: RoaringBitmap = (0..).into_iter().map(|x| 5 * x).take_while(|x| *x < 150).collect();
+        let b3: RoaringBitmap = (0..).into_iter().map(|x| 7 * x).take_while(|x| *x < 150).collect();
 
-    candidates_array.reverse();
+        let parts_candidates = vec![b0, b1, b2, b3];
 
-    Ok(ExactWordsCombinationCache { combinations: candidates_array, unioned: forbidden_candidates })
+        let combinations = ComputeCombinations::new(parts_candidates);
+
+        insta::assert_snapshot!(print_compute_combinations(&combinations), @r###"
+        Level 1:
+            0 [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, ]
+            1 [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93, 96, 99, 102, 105, 108, 111, 114, 117, 120, 123, 126, 129, 132, 135, 138, 141, 144, 147, ]
+            2 [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, ]
+            3 [0, 7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84, 91, 98, 105, 112, 119, 126, 133, 140, 147, ]
+        Level 2:
+            1 [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144, ]
+            2 [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, ]
+            3 [0, 14, 28, 42, 56, 70, 84, 98, 112, 126, 140, ]
+            2 [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, ]
+            3 [0, 21, 42, 63, 84, 105, 126, 147, ]
+            3 [0, 35, 70, 105, 140, ]
+        Level 3:
+            2 [0, 30, 60, 90, 120, ]
+            3 [0, 42, 84, 126, ]
+            3 [0, 70, 140, ]
+            3 [0, 105, ]
+        Level 4:
+            3 [0, ]
+        "###);
+
+        let combinations = combinations.finish();
+        insta::assert_snapshot!(print_combinations(&combinations), @r###"
+        [0, ]
+        [30, 42, 60, 70, 84, 90, 105, 120, 126, 140, ]
+        [6, 10, 12, 14, 15, 18, 20, 21, 24, 28, 35, 36, 40, 45, 48, 50, 54, 56, 63, 66, 72, 75, 78, 80, 96, 98, 100, 102, 108, 110, 112, 114, 130, 132, 135, 138, 144, 147, ]
+        [2, 3, 4, 5, 7, 8, 9, 16, 22, 25, 26, 27, 32, 33, 34, 38, 39, 44, 46, 49, 51, 52, 55, 57, 58, 62, 64, 65, 68, 69, 74, 76, 77, 81, 82, 85, 86, 87, 88, 91, 92, 93, 94, 95, 99, 104, 106, 111, 115, 116, 117, 118, 119, 122, 123, 124, 125, 128, 129, 133, 134, 136, 141, 142, 145, 146, 148, ]
+        "###);
+    }
+    #[test]
+    fn compute_combinations_1() {
+        let b0: RoaringBitmap = (0..).into_iter().map(|x| 2 * x).take_while(|x| *x < 150).collect();
+
+        let parts_candidates = vec![b0];
+
+        let combinations = ComputeCombinations::new(parts_candidates);
+
+        insta::assert_snapshot!(print_compute_combinations(&combinations), @r###"
+        Level 1:
+            0 [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, ]
+        "###);
+
+        let combinations = combinations.finish();
+        insta::assert_snapshot!(print_combinations(&combinations), @r###"
+        [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, ]
+        "###);
+    }
+    #[test]
+    fn compute_combinations_2() {
+        let b0: RoaringBitmap = (0..).into_iter().map(|x| 2 * x).take_while(|x| *x < 150).collect();
+        let b1: RoaringBitmap = (0..).into_iter().map(|x| 3 * x).take_while(|x| *x < 150).collect();
+
+        let parts_candidates = vec![b0, b1];
+        let combinations = ComputeCombinations::new(parts_candidates);
+
+        insta::assert_snapshot!(print_compute_combinations(&combinations), @r###"
+        Level 1:
+            0 [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, ]
+            1 [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93, 96, 99, 102, 105, 108, 111, 114, 117, 120, 123, 126, 129, 132, 135, 138, 141, 144, 147, ]
+        Level 2:
+            1 [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144, ]
+        "###);
+
+        let combinations = combinations.finish();
+        insta::assert_snapshot!(print_combinations(&combinations), @r###"
+        [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120, 126, 132, 138, 144, ]
+        [2, 3, 4, 8, 9, 10, 14, 15, 16, 20, 21, 22, 26, 27, 28, 32, 33, 34, 38, 39, 40, 44, 45, 46, 50, 51, 52, 56, 57, 58, 62, 63, 64, 68, 69, 70, 74, 75, 76, 80, 81, 82, 86, 87, 88, 92, 93, 94, 98, 99, 100, 104, 105, 106, 110, 111, 112, 116, 117, 118, 122, 123, 124, 128, 129, 130, 134, 135, 136, 140, 141, 142, 146, 147, 148, ]
+        "###);
+    }
 }
